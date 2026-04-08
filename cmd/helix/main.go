@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/yourusername/helix/internal/api"
+	"github.com/yourusername/helix/internal/cache"
 	"github.com/yourusername/helix/internal/esm"
 	"github.com/yourusername/helix/internal/queue"
 	"github.com/yourusername/helix/internal/worker"
@@ -32,7 +33,8 @@ func main() {
 
 	esmClient := esm.NewClient()
 	jobQueue := queue.NewQueue(redisAddr)
-	handler := api.NewHandler(esmClient, jobQueue)
+	foldCache := cache.NewCache(redisAddr)
+	handler := api.NewHandler(esmClient, jobQueue, foldCache)
 	w := worker.NewWorker(jobQueue, esmClient)
 
 	ctx, cancel := context.WithCancel(context.Background())
