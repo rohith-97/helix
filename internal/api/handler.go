@@ -3,17 +3,22 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/yourusername/helix/internal/esm"
 	"github.com/yourusername/helix/internal/metrics"
+	"github.com/yourusername/helix/internal/queue"
 )
 
 type Handler struct {
-	esm *esm.Client
+	esm   *esm.Client
+	queue *queue.Queue
 }
 
-func NewHandler(client *esm.Client) *Handler {
-	return &Handler{esm: client}
+func NewHandler(client *esm.Client, q *queue.Queue) *Handler {
+	return &Handler{esm: client, queue: q}
 }
 
 type FoldRequest struct {
@@ -33,6 +38,15 @@ type BatchFoldRequest struct {
 type BatchFoldResponse struct {
 	Results []FoldResponse `json:"results"`
 	Errors  []string       `json:"errors,omitempty"`
+}
+
+type JobResponse struct {
+	ID      string          `json:"id"`
+	Status  queue.JobStatus `json:"status"`
+	Result  string          `json:"result,omitempty"`
+	Error   string          `json:"error,omitempty"`
+	Created time.Time       `json:"created"`
+	Updated time.Time       `json:"updated"`
 }
 
 type ErrorResponse struct {
@@ -108,6 +122,62 @@ func (h *Handler) BatchFold(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, response, http.StatusOK)
+}
+
+func (h *Handler) EnqueueFold(w http.ResponseWriter, r *http.Request) {
+	var req FoldRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	if req.Sequence == "" {
+		writeError(w, "sequence is required", http.StatusBadRequest)
+		return
+	}
+
+	job := &queue.Job{
+		ID:       uuid.New().String(),
+		Sequence: req.Sequence,
+		Status:   queue.StatusPending,
+		Created:  time.Now(),
+		Updated:  time.Now(),
+	}
+
+	if err := h.queue.Enqueue(r.Context(), job); err != nil {
+		writeError(w, "failed to enqueue job", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, JobResponse{
+		ID:      job.ID,
+		Status:  job.Status,
+		Created: job.Created,
+		Updated: job.Updated,
+	}, http.StatusAccepted)
+}
+
+func (h *Handler) GetJob(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, "job id is required", http.StatusBadRequest)
+		return
+	}
+
+	job, err := h.queue.GetJob(r.Context(), id)
+	if err != nil {
+		writeError(w, "job not found", http.StatusNotFound)
+		return
+	}
+
+	writeJSON(w, JobResponse{
+		ID:      job.ID,
+		Status:  job.Status,
+		Result:  job.Result,
+		Error:   job.Error,
+		Created: job.Created,
+		Updated: job.Updated,
+	}, http.StatusOK)
 }
 
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {

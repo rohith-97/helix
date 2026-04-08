@@ -15,6 +15,8 @@ import (
 
 	"github.com/yourusername/helix/internal/api"
 	"github.com/yourusername/helix/internal/esm"
+	"github.com/yourusername/helix/internal/queue"
+	"github.com/yourusername/helix/internal/worker"
 )
 
 func main() {
@@ -23,8 +25,20 @@ func main() {
 		port = "8080"
 	}
 
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+
 	esmClient := esm.NewClient()
-	handler := api.NewHandler(esmClient)
+	jobQueue := queue.NewQueue(redisAddr)
+	handler := api.NewHandler(esmClient, jobQueue)
+	w := worker.NewWorker(jobQueue, esmClient)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go w.Run(ctx)
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
@@ -34,6 +48,8 @@ func main() {
 	r.Get("/health", handler.Health)
 	r.Post("/fold", handler.Fold)
 	r.Post("/fold/batch", handler.BatchFold)
+	r.Post("/fold/async", handler.EnqueueFold)
+	r.Get("/fold/jobs/{id}", handler.GetJob)
 	r.Handle("/metrics", promhttp.Handler())
 
 	srv := &http.Server{
@@ -53,10 +69,12 @@ func main() {
 	<-quit
 
 	log.Println("shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	cancel()
 
-	if err := srv.Shutdown(ctx); err != nil {
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Fatalf("forced shutdown: %v", err)
 	}
 
