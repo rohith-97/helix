@@ -15,6 +15,7 @@ import (
 
 	"github.com/yourusername/helix/internal/afdb"
 	"github.com/yourusername/helix/internal/api"
+	"github.com/yourusername/helix/internal/audit"
 	"github.com/yourusername/helix/internal/cache"
 	"github.com/yourusername/helix/internal/esm"
 	"github.com/yourusername/helix/internal/queue"
@@ -33,16 +34,26 @@ func main() {
 		redisAddr = "localhost:6379"
 	}
 
+	pgConn := os.Getenv("DATABASE_URL")
+	if pgConn == "" {
+		pgConn = "postgres://localhost/helix"
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	auditLogger, err := audit.NewLogger(ctx, pgConn)
+	if err != nil {
+		log.Fatalf("failed to connect to postgres: %v", err)
+	}
+
 	esmClient := esm.NewClient()
 	afdbClient := afdb.NewClient()
 	foldCache := cache.NewCache(redisAddr)
 	jobQueue := queue.NewQueue(redisAddr)
-	foldRouter := router.NewRouter(foldCache, afdbClient, esmClient)
-	handler := api.NewHandler(foldRouter, jobQueue)
+	foldRouter := router.NewRouter(foldCache, afdbClient, esmClient, auditLogger)
+	handler := api.NewHandler(foldRouter, jobQueue, auditLogger)
 	w := worker.NewWorker(jobQueue, esmClient)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	go w.Run(ctx)
 
@@ -56,6 +67,8 @@ func main() {
 	r.Post("/fold/batch", handler.BatchFold)
 	r.Post("/fold/async", handler.EnqueueFold)
 	r.Get("/fold/jobs/{id}", handler.GetJob)
+	r.Get("/experiments/{id}", handler.GetExperiment)
+	r.Get("/experiments/{id}/stats", handler.GetExperimentStats)
 	r.Handle("/metrics", promhttp.Handler())
 
 	srv := &http.Server{

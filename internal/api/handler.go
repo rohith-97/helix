@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/yourusername/helix/internal/audit"
 	"github.com/yourusername/helix/internal/queue"
 	"github.com/yourusername/helix/internal/router"
 )
@@ -14,30 +15,34 @@ import (
 type Handler struct {
 	router *router.Router
 	queue  *queue.Queue
+	audit  *audit.Logger
 }
 
-func NewHandler(r *router.Router, q *queue.Queue) *Handler {
-	return &Handler{router: r, queue: q}
+func NewHandler(r *router.Router, q *queue.Queue, al *audit.Logger) *Handler {
+	return &Handler{router: r, queue: q, audit: al}
 }
 
 type FoldRequest struct {
-	Sequence  string `json:"sequence"`
-	Accession string `json:"accession,omitempty"`
+	Sequence     string `json:"sequence"`
+	Accession    string `json:"accession,omitempty"`
+	ExperimentID string `json:"experiment_id,omitempty"`
 }
 
 type FoldResponse struct {
-	PDB        string        `json:"pdb"`
-	Sequence   string        `json:"sequence"`
-	Accession  string        `json:"accession,omitempty"`
-	Source     router.Source `json:"source"`
-	Confidence float64       `json:"confidence,omitempty"`
-	ElapsedS   float64       `json:"elapsed_seconds"`
-	Cost       int           `json:"cost"`
-	Cached     bool          `json:"cached"`
+	PDB          string        `json:"pdb"`
+	Sequence     string        `json:"sequence"`
+	Accession    string        `json:"accession,omitempty"`
+	Source       router.Source `json:"source"`
+	Confidence   float64       `json:"confidence,omitempty"`
+	ElapsedS     float64       `json:"elapsed_seconds"`
+	Cost         int           `json:"cost"`
+	Cached       bool          `json:"cached"`
+	ExperimentID string        `json:"experiment_id,omitempty"`
 }
 
 type BatchFoldRequest struct {
-	Sequences []string `json:"sequences"`
+	Sequences    []string `json:"sequences"`
+	ExperimentID string   `json:"experiment_id,omitempty"`
 }
 
 type BatchFoldResponse struct {
@@ -71,8 +76,9 @@ func (h *Handler) Fold(w http.ResponseWriter, r *http.Request) {
 	}
 
 	result, err := h.router.Fold(r.Context(), router.FoldRequest{
-		Sequence:  req.Sequence,
-		Accession: req.Accession,
+		Sequence:     req.Sequence,
+		Accession:    req.Accession,
+		ExperimentID: req.ExperimentID,
 	})
 	if err != nil {
 		writeError(w, err.Error(), http.StatusInternalServerError)
@@ -80,14 +86,15 @@ func (h *Handler) Fold(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, FoldResponse{
-		PDB:        result.PDB,
-		Sequence:   result.Sequence,
-		Accession:  result.Accession,
-		Source:     result.Source,
-		Confidence: result.Confidence,
-		ElapsedS:   result.Elapsed.Seconds(),
-		Cost:       result.Cost,
-		Cached:     result.Source == router.SourceCache,
+		PDB:          result.PDB,
+		Sequence:     result.Sequence,
+		Accession:    result.Accession,
+		Source:       result.Source,
+		Confidence:   result.Confidence,
+		ElapsedS:     result.Elapsed.Seconds(),
+		Cost:         result.Cost,
+		Cached:       result.Source == router.SourceCache,
+		ExperimentID: req.ExperimentID,
 	}, http.StatusOK)
 }
 
@@ -110,7 +117,10 @@ func (h *Handler) BatchFold(w http.ResponseWriter, r *http.Request) {
 
 	var response BatchFoldResponse
 	for _, seq := range req.Sequences {
-		result, err := h.router.Fold(r.Context(), router.FoldRequest{Sequence: seq})
+		result, err := h.router.Fold(r.Context(), router.FoldRequest{
+			Sequence:     seq,
+			ExperimentID: req.ExperimentID,
+		})
 		if err != nil {
 			response.Errors = append(response.Errors, err.Error())
 			continue
@@ -140,11 +150,11 @@ func (h *Handler) EnqueueFold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// cache check before enqueuing
 	if req.Sequence != "" {
 		result, err := h.router.Fold(r.Context(), router.FoldRequest{
-			Sequence:  req.Sequence,
-			Accession: req.Accession,
+			Sequence:     req.Sequence,
+			Accession:    req.Accession,
+			ExperimentID: req.ExperimentID,
 		})
 		if err == nil && result.Source == router.SourceCache {
 			writeJSON(w, FoldResponse{
@@ -201,6 +211,38 @@ func (h *Handler) GetJob(w http.ResponseWriter, r *http.Request) {
 		Created: job.Created,
 		Updated: job.Updated,
 	}, http.StatusOK)
+}
+
+func (h *Handler) GetExperiment(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, "experiment id is required", http.StatusBadRequest)
+		return
+	}
+
+	entries, err := h.audit.Query(r.Context(), id)
+	if err != nil {
+		writeError(w, "failed to query experiment", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, entries, http.StatusOK)
+}
+
+func (h *Handler) GetExperimentStats(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	if id == "" {
+		writeError(w, "experiment id is required", http.StatusBadRequest)
+		return
+	}
+
+	stats, err := h.audit.Stats(r.Context(), id)
+	if err != nil {
+		writeError(w, "failed to get stats", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, stats, http.StatusOK)
 }
 
 func (h *Handler) Health(w http.ResponseWriter, r *http.Request) {
