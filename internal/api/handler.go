@@ -7,32 +7,33 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
-	"github.com/redis/go-redis/v9"
-	"github.com/yourusername/helix/internal/cache"
-	"github.com/yourusername/helix/internal/esm"
-	"github.com/yourusername/helix/internal/metrics"
 	"github.com/yourusername/helix/internal/queue"
+	"github.com/yourusername/helix/internal/router"
 )
 
 type Handler struct {
-	esm   *esm.Client
-	queue *queue.Queue
-	cache *cache.Cache
+	router *router.Router
+	queue  *queue.Queue
 }
 
-func NewHandler(client *esm.Client, q *queue.Queue, c *cache.Cache) *Handler {
-	return &Handler{esm: client, queue: q, cache: c}
+func NewHandler(r *router.Router, q *queue.Queue) *Handler {
+	return &Handler{router: r, queue: q}
 }
 
 type FoldRequest struct {
-	Sequence string `json:"sequence"`
+	Sequence  string `json:"sequence"`
+	Accession string `json:"accession,omitempty"`
 }
 
 type FoldResponse struct {
-	PDB      string  `json:"pdb"`
-	Sequence string  `json:"sequence"`
-	ElapsedS float64 `json:"elapsed_seconds"`
-	Cached   bool    `json:"cached"`
+	PDB        string        `json:"pdb"`
+	Sequence   string        `json:"sequence"`
+	Accession  string        `json:"accession,omitempty"`
+	Source     router.Source `json:"source"`
+	Confidence float64       `json:"confidence,omitempty"`
+	ElapsedS   float64       `json:"elapsed_seconds"`
+	Cost       int           `json:"cost"`
+	Cached     bool          `json:"cached"`
 }
 
 type BatchFoldRequest struct {
@@ -64,44 +65,29 @@ func (h *Handler) Fold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Sequence == "" {
-		writeError(w, "sequence is required", http.StatusBadRequest)
+	if req.Sequence == "" && req.Accession == "" {
+		writeError(w, "sequence or accession is required", http.StatusBadRequest)
 		return
 	}
 
-	// cache check
-	if entry, err := h.cache.Get(r.Context(), req.Sequence); err == nil {
-		metrics.FoldRequestsTotal.WithLabelValues("cache_hit").Inc()
-		writeJSON(w, FoldResponse{
-			PDB:      entry.PDB,
-			Sequence: entry.Sequence,
-			ElapsedS: 0,
-			Cached:   true,
-		}, http.StatusOK)
-		return
-	}
-
-	metrics.FoldSequenceLength.Observe(float64(len(req.Sequence)))
-
-	result, err := h.esm.Fold(r.Context(), req.Sequence)
+	result, err := h.router.Fold(r.Context(), router.FoldRequest{
+		Sequence:  req.Sequence,
+		Accession: req.Accession,
+	})
 	if err != nil {
-		metrics.FoldRequestsTotal.WithLabelValues("error").Inc()
-		metrics.FoldDuration.WithLabelValues("error").Observe(0)
 		writeError(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	// store in cache
-	_ = h.cache.Set(r.Context(), req.Sequence, result.PDB)
-
-	metrics.FoldRequestsTotal.WithLabelValues("success").Inc()
-	metrics.FoldDuration.WithLabelValues("success").Observe(result.Elapsed.Seconds())
-
 	writeJSON(w, FoldResponse{
-		PDB:      result.PDB,
-		Sequence: result.Sequence,
-		ElapsedS: result.Elapsed.Seconds(),
-		Cached:   false,
+		PDB:        result.PDB,
+		Sequence:   result.Sequence,
+		Accession:  result.Accession,
+		Source:     result.Source,
+		Confidence: result.Confidence,
+		ElapsedS:   result.Elapsed.Seconds(),
+		Cost:       result.Cost,
+		Cached:     result.Source == router.SourceCache,
 	}, http.StatusOK)
 }
 
@@ -122,23 +108,20 @@ func (h *Handler) BatchFold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	metrics.BatchSize.Observe(float64(len(req.Sequences)))
-
-	results, errs := h.esm.FoldBatch(r.Context(), req.Sequences)
-
 	var response BatchFoldResponse
-	for i, result := range results {
-		if errs[i] != nil {
-			response.Errors = append(response.Errors, errs[i].Error())
+	for _, seq := range req.Sequences {
+		result, err := h.router.Fold(r.Context(), router.FoldRequest{Sequence: seq})
+		if err != nil {
+			response.Errors = append(response.Errors, err.Error())
 			continue
 		}
-		_ = h.cache.Set(r.Context(), result.Sequence, result.PDB)
-		metrics.FoldRequestsTotal.WithLabelValues("success").Inc()
-		metrics.FoldDuration.WithLabelValues("success").Observe(result.Elapsed.Seconds())
 		response.Results = append(response.Results, FoldResponse{
 			PDB:      result.PDB,
 			Sequence: result.Sequence,
+			Source:   result.Source,
 			ElapsedS: result.Elapsed.Seconds(),
+			Cost:     result.Cost,
+			Cached:   result.Source == router.SourceCache,
 		})
 	}
 
@@ -152,21 +135,28 @@ func (h *Handler) EnqueueFold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Sequence == "" {
-		writeError(w, "sequence is required", http.StatusBadRequest)
+	if req.Sequence == "" && req.Accession == "" {
+		writeError(w, "sequence or accession is required", http.StatusBadRequest)
 		return
 	}
 
 	// cache check before enqueuing
-	if entry, err := h.cache.Get(r.Context(), req.Sequence); err == nil {
-		metrics.FoldRequestsTotal.WithLabelValues("cache_hit").Inc()
-		writeJSON(w, FoldResponse{
-			PDB:      entry.PDB,
-			Sequence: entry.Sequence,
-			ElapsedS: 0,
-			Cached:   true,
-		}, http.StatusOK)
-		return
+	if req.Sequence != "" {
+		result, err := h.router.Fold(r.Context(), router.FoldRequest{
+			Sequence:  req.Sequence,
+			Accession: req.Accession,
+		})
+		if err == nil && result.Source == router.SourceCache {
+			writeJSON(w, FoldResponse{
+				PDB:      result.PDB,
+				Sequence: result.Sequence,
+				Source:   result.Source,
+				ElapsedS: result.Elapsed.Seconds(),
+				Cost:     result.Cost,
+				Cached:   true,
+			}, http.StatusOK)
+			return
+		}
 	}
 
 	job := &queue.Job{
@@ -226,6 +216,3 @@ func writeJSON(w http.ResponseWriter, v any, status int) {
 func writeError(w http.ResponseWriter, msg string, status int) {
 	writeJSON(w, ErrorResponse{Error: msg}, status)
 }
-
-// keep redis import used
-var _ = redis.Nil

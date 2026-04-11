@@ -13,10 +13,12 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
+	"github.com/yourusername/helix/internal/afdb"
 	"github.com/yourusername/helix/internal/api"
 	"github.com/yourusername/helix/internal/cache"
 	"github.com/yourusername/helix/internal/esm"
 	"github.com/yourusername/helix/internal/queue"
+	"github.com/yourusername/helix/internal/router"
 	"github.com/yourusername/helix/internal/worker"
 )
 
@@ -32,9 +34,11 @@ func main() {
 	}
 
 	esmClient := esm.NewClient()
-	jobQueue := queue.NewQueue(redisAddr)
+	afdbClient := afdb.NewClient()
 	foldCache := cache.NewCache(redisAddr)
-	handler := api.NewHandler(esmClient, jobQueue, foldCache)
+	jobQueue := queue.NewQueue(redisAddr)
+	foldRouter := router.NewRouter(foldCache, afdbClient, esmClient)
+	handler := api.NewHandler(foldRouter, jobQueue)
 	w := worker.NewWorker(jobQueue, esmClient)
 
 	ctx, cancel := context.WithCancel(context.Background())
