@@ -53,7 +53,7 @@ func main() {
 	jobQueue := queue.NewQueue(redisAddr)
 	foldRouter := router.NewRouter(foldCache, afdbClient, esmClient, auditLogger)
 	handler := api.NewHandler(foldRouter, jobQueue, auditLogger)
-	w := worker.NewWorker(jobQueue, esmClient)
+	w := worker.NewWorker(jobQueue, esmClient, foldCache)
 
 	go w.Run(ctx)
 
